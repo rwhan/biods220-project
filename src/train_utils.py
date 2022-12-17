@@ -1,291 +1,117 @@
-"""
-Based of the implementation of "An attention based deep learning model of clinical events in the intensive care unit".
+import data_utils
 
-Credit: DA Kaji (https://github.com/deepak-kaji/mimic-lstm)
-
-"""
-# tmp
-FILE = "/home/jamesburgess/assign2/mimic_database/mapped_elements/CHARTEVENTS_reduced_24_hour_blocks_plus_admissions_plus_patients_plus_scripts_plus_icds_plus_notes.csv"
-
-import concurrent.futures
-import csv
-import gc
-import math
-import os
-import pickle
-import re
-from functools import reduce
-from operator import add
-from time import time
-
-import numpy as np
-import pandas as pd
+from sklearn.metrics import roc_curve, auc as auc_function
 import tensorflow as tf
-from sklearn.metrics import (
-    accuracy_score,
-    classification_report,
-    confusion_matrix,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
-from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import MinMaxScaler, RobustScaler
-from tensorflow.keras import regularizers  # model_from_json
-from tensorflow.keras import Input, Model  # model_from_json
-from tensorflow.keras import backend as K
-from tensorflow.keras.callbacks import ModelCheckpoint, TensorBoard
-from tensorflow.keras.layers import (
-    LSTM,
-    Dense,
-    Embedding,
-    Flatten,
-    Masking,
-    Permute,
-    Reshape,
-    TimeDistributed,
-    multiply,
-)
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+import pandas as pd
+import numpy as np
 
-from data_utils import return_data
+# config
+tf.keras.backend.set_floatx("float32")
 
+ROOT = "/home/ec2-user/biods220/project/assign2"  # Put your root path here
 
-# Driver for training model
-def train(
-    model_name="kaji_mach_0",
-    synth_data=False,
-    target="MI",
-    balancer=True,
-    predict=False,
-    return_model=False,
-    n_percentage=1.0,
-    time_steps=14,
-    epochs=10,
-    build_model=None,
-):
+def load_masked_lstm_model(num_timesteps, num_pretrain_features, num_pretrain_labels, 
+                            pretrain_feat_mask, pretrain_path = 'pretrained.h5',
+                            lstm_hidden_units=256):
+    model_pt = tf.keras.Sequential()
+    model_pt.add(tf.keras.layers.Masking(mask_value=0, input_shape=(num_timesteps, num_pretrain_features)))
+    model_pt.add(tf.keras.layers.LSTM(lstm_hidden_units, return_sequences = True))
+    model_pt.add(tf.keras.layers.Dropout(0.5))
+    model_pt.add(tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(num_pretrain_labels)))
+    for layer in model_pt.layers[1:]:
+        layer.supports_masking = True
+    
+    if pretrain_path is not None:
+        print('LOADING PRETRAINED WEIGHTS')
+        model_pt.load_weights(pretrain_path)
+    
+    num_features = sum(pretrain_feat_mask)
+    model = tf.keras.Sequential()
+    model.add(tf.keras.layers.Masking(mask_value=0, input_shape=(num_timesteps, num_features)))
+    model.add(tf.keras.layers.LSTM(lstm_hidden_units, return_sequences = True))
+    model.add(tf.keras.layers.Dropout(0.5))
+    model.add(tf.keras.layers.TimeDistributed(tf.keras.layers.Dense(1, activation = 'sigmoid')))
+    for layer in model.layers[1:]:
+        layer.supports_masking = True
 
-    """
-    Use Keras model.fit using parameter inputs
-    Args:
-    ----
-    model_name : Parameter used for naming the checkpoint_dir
-    synth_data : Default to False. Allows you to use synthetic or real data.
-    Return:
-    -------
-    Nonetype. Fits model only.
-    """
+    transfer_weights = model_pt.layers[1].trainable_weights
+    transfer_weights[0] = tf.boolean_mask(transfer_weights[0], pretrain_feat_mask)
+    model.layers[1].set_weights(transfer_weights)
+    return model
 
-    f = open("./pickled_objects/X_TRAIN_{0}.txt".format(target), "rb")
-    X_TRAIN = pickle.load(f)
-    f.close()
-
-    f = open("./pickled_objects/Y_TRAIN_{0}.txt".format(target), "rb")
-    Y_TRAIN = pickle.load(f)
-    f.close()
-
-    f = open("./pickled_objects/X_VAL_{0}.txt".format(target), "rb")
-    X_VAL = pickle.load(f)
-    f.close()
-
-    f = open("./pickled_objects/Y_VAL_{0}.txt".format(target), "rb")
-    Y_VAL = pickle.load(f)
-    f.close()
-
-    f = open("./pickled_objects/x_boolmat_val_{0}.txt".format(target), "rb")
-    X_BOOLMAT_VAL = pickle.load(f)
-    f.close()
-
-    f = open("./pickled_objects/y_boolmat_val_{0}.txt".format(target), "rb")
-    Y_BOOLMAT_VAL = pickle.load(f)
-    f.close()
-
-    f = open("./pickled_objects/no_feature_cols_{0}.txt".format(target), "rb")
-    no_feature_cols = pickle.load(f)
-    f.close()
-
-    # X_TRAIN = X_TRAIN[0:int(n_percentage*X_TRAIN.shape[0])]
-    # Y_TRAIN = Y_TRAIN[0:int(n_percentage*Y_TRAIN.shape[0])]
-
-    # build model
-    model = build_model(
-        num_features=no_feature_cols, output_summary=True, time_steps=time_steps
-    )
-
-    # init callbacks
-    tb_callback = TensorBoard(
-        log_dir="./logs/{0}_{1}.log".format(model_name, time),
-        histogram_freq=0,
-        write_grads=False,
-        write_images=True,
-        write_graph=True,
-    )
-
-    # Make checkpoint dir and init checkpointer
-    checkpoint_dir = "./saved_models/{0}".format(model_name)
-
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-
-    checkpointer = ModelCheckpoint(
-        filepath=checkpoint_dir + "/model.{epoch:02d}-{val_loss:.2f}.hdf5",
-        monitor="val_loss",
-        verbose=0,
-        save_best_only=True,
-        save_weights_only=False,
-        mode="auto",
-        period=1,
-    )
-
-    # fit
-    model.fit(
-        x=X_TRAIN,
-        y=Y_TRAIN,
-        batch_size=16,
-        epochs=epochs,
-        callbacks=[tb_callback],  # , checkpointer],
-        validation_data=(X_VAL, Y_VAL),
-        shuffle=True,
-    )
-
-    model.save("./saved_models/{0}.h5".format(model_name))
-
-    if predict:
-        print("TARGET: {0}".format(target))
-        Y_PRED = model.predict(X_VAL)
-        Y_PRED = Y_PRED[~Y_BOOLMAT_VAL]
-        np.unique(Y_PRED)
-        Y_VAL = Y_VAL[~Y_BOOLMAT_VAL]
-        Y_PRED_TRAIN = model.predict(X_TRAIN)
-        print("Confusion Matrix Validation")
-        print(confusion_matrix(Y_VAL, np.around(Y_PRED)))
-        print("Validation Accuracy")
-        print(accuracy_score(Y_VAL, np.around(Y_PRED)))
-        print("ROC AUC SCORE VAL")
-        print(roc_auc_score(Y_VAL, Y_PRED))
-        print("CLASSIFICATION REPORT VAL")
-        print(classification_report(Y_VAL, np.around(Y_PRED)))
-
-    if return_model:
-        return model
-
-
-def pickle_objects(target="MI", time_steps=14, split_data=None):
-
+def run_experiment(target, pretrain_target, pretrain_features, num_pretrain_labels, label_frac = 1, pretrain = False, seed = 0):
     (
-        X_TRAIN,
-        X_VAL,
-        Y_TRAIN,
-        Y_VAL,
+        train_x,
+        val_x,
+        train_y,
+        val_y,
         no_feature_cols,
-        X_TEST,
-        Y_TEST,
-        x_boolmat_test,
-        y_boolmat_test,
-        x_boolmat_val,
-        y_boolmat_val,
+        no_label_cols,
+        test_x,
+        test_y,
+        val_boolmat,
+        test_boolmat,
         features,
-    ) = return_data(
-        FILE,
-        return_cols=True,
-        balancer=True,
-        target=target,
-        pad=True,
-        split=True,
-        time_steps=time_steps,
-        split_data=split_data,
+        labels,
+    ) = data_utils.load_seq_dataset(ROOT, target)
+
+    np.random.seed(seed)
+    num_train_samples = int(label_frac * len(train_x))
+    train_ind = np.random.choice(len(train_x), size = num_train_samples, replace=False)
+
+    train_x = train_x.astype(np.float32)[train_ind]
+    train_y = train_y.astype(np.float32)[train_ind]
+
+    val_x = val_x.astype(np.float32)
+    val_y = val_y.astype(np.float32)
+    test_x = test_x.astype(np.float32)
+    test_y = test_y.astype(np.float32)
+    
+    print('RUNNING EXPERIMENT FOR {} with label_frac: {}, pretrain: {}, and seed: {}'.format(target, label_frac, pretrain, seed))
+
+    print("train shapes ", train_x.shape, train_y.shape)
+    print("val shapes   ", val_x.shape, val_y.shape)
+    print("test shapes  ", test_x.shape, test_y.shape)
+    
+    pretrain_feat_mask = [True if x in features else False for x in pretrain_features]
+    pretrain_path = 'output/' + str(pretrain_target) + '_pretrained.h5' if pretrain else None
+    model = load_masked_lstm_model(train_x.shape[-2], len(pretrain_features), num_pretrain_labels, 
+                                    pretrain_feat_mask, pretrain_path)
+
+    # LE
+    model.layers[1].trainable = False
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.01),
+        loss='binary_crossentropy', 
+        metrics=['accuracy', tf.keras.metrics.AUC (curve='ROC', name='AUROC')],
+    )
+    history = model.fit(
+        x = train_x, y = train_y, epochs = 50, 
+        validation_data = (val_x, val_y),
+        callbacks = [tf.keras.callbacks.EarlyStopping(patience=20,restore_best_weights=True)]
+    )
+    test_y_pred = model.predict(test_x)
+    y_pred_masked = test_y_pred[~test_boolmat]
+    y_true_masked = test_y[~test_boolmat]
+    fpr, tpr, thresholds = roc_curve(y_true_masked, y_pred_masked)
+    le_auc = auc_function(fpr, tpr)
+    
+    # FT
+    model.layers[1].trainable = True
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001),
+        loss='binary_crossentropy', 
+        metrics=['accuracy', tf.keras.metrics.AUC (curve='ROC', name='AUROC')],
+    )
+    history = model.fit(
+        x = train_x, y = train_y, epochs = 50, 
+        validation_data = (val_x, val_y),
+        callbacks = [tf.keras.callbacks.EarlyStopping(patience=20,restore_best_weights=True)]
     )
 
-    f = open("./pickled_objects/X_TRAIN_{0}.txt".format(target), "wb")
-    pickle.dump(X_TRAIN, f)
-    f.close()
-
-    f = open("./pickled_objects/X_VAL_{0}.txt".format(target), "wb")
-    pickle.dump(X_VAL, f)
-    f.close()
-
-    f = open("./pickled_objects/Y_TRAIN_{0}.txt".format(target), "wb")
-    pickle.dump(Y_TRAIN, f)
-    f.close()
-
-    f = open("./pickled_objects/Y_VAL_{0}.txt".format(target), "wb")
-    pickle.dump(Y_VAL, f)
-    f.close()
-
-    f = open("./pickled_objects/X_TEST_{0}.txt".format(target), "wb")
-    pickle.dump(X_TEST, f)
-    f.close()
-
-    f = open("./pickled_objects/Y_TEST_{0}.txt".format(target), "wb")
-    pickle.dump(Y_TEST, f)
-    f.close()
-
-    f = open("./pickled_objects/x_boolmat_test_{0}.txt".format(target), "wb")
-    pickle.dump(x_boolmat_test, f)
-    f.close()
-
-    f = open("./pickled_objects/y_boolmat_test_{0}.txt".format(target), "wb")
-    pickle.dump(y_boolmat_test, f)
-    f.close()
-
-    f = open("./pickled_objects/x_boolmat_val_{0}.txt".format(target), "wb")
-    pickle.dump(x_boolmat_val, f)
-    f.close()
-
-    f = open("./pickled_objects/y_boolmat_val_{0}.txt".format(target), "wb")
-    pickle.dump(y_boolmat_val, f)
-    f.close()
-
-    f = open("./pickled_objects/no_feature_cols_{0}.txt".format(target), "wb")
-    pickle.dump(no_feature_cols, f)
-    f.close()
-
-    f = open("./pickled_objects/features_{0}.txt".format(target), "wb")
-    pickle.dump(features, f)
-    f.close()
-
-
-def run_trainer(build_model_fn, split_data_fn):
-
-    if not os.path.exists("./pickled_objects"):
-        os.makedirs("./pickled_objects")
-
-    """
-    pickle_objects(target='MI', time_steps=14, split_data=split_data_fn)
-    pickle_objects(target='SEPSIS', time_steps=14, split_data=split_data_fn)
-    pickle_objects(target='VANCOMYCIN', time_steps=14, split_data=split_data_fn)
-    """
-
-    print("##### Training Myocardian Infarction Model #####")
-    train(
-        model_name="MI",
-        epochs=13,
-        synth_data=False,
-        predict=True,
-        target="MI",
-        time_steps=14,
-        build_model=build_model_fn,
-    )
-
-    print("##### Training Vancomycin Model #####")
-    train(
-        model_name="VANCOMYCIN",
-        epochs=14,
-        synth_data=False,
-        predict=True,
-        target="VANCOMYCIN",
-        time_steps=14,
-        build_model=build_model_fn,
-    )
-
-    print("##### Training Sepsis Model #####")
-    train(
-        model_name="SEPSIS",
-        epochs=17,
-        synth_data=False,
-        predict=True,
-        target="SEPSIS",
-        time_steps=14,
-        build_model=build_model_fn,
-    )
+    test_y_pred = model.predict(test_x)
+    y_pred_masked = test_y_pred[~test_boolmat]
+    y_true_masked = test_y[~test_boolmat]
+    fpr, tpr, thresholds = roc_curve(y_true_masked, y_pred_masked)
+    ft_auc = auc_function(fpr, tpr)
+    return le_auc, ft_auc

@@ -105,26 +105,14 @@ class PadSequences(object):
 
         return df
 
-    def ZScoreNormalize(self, matrix, num_targets = 1):
-
+    def ZScoreNormalize(self, matrix):
         """Performs Z Score Normalization for 3rd order tensors
         matrix should be (batchsize, time_steps, features)
         Padded time steps should be masked with np.nan"""
-
-        x_matrix = matrix[:, :, 0:-num_targets]
-        y_matrix = matrix[:, :, -num_targets:]
+        means = np.nanmean(matrix, axis=(0, 1))
+        stds = np.nanstd(matrix, axis=(0, 1))
+        return (matrix - means) / stds
         
-        def norm(matrix):
-            means = np.nanmean(matrix, axis=(0, 1))
-            stds = np.nanstd(matrix, axis=(0, 1))
-            return (matrix - means) / stds
-        
-        x_matrix = norm(x_matrix)
-        y_matrix = norm(y_matrix) if num_targets > 1 else y_matrix
-        
-        matrix = np.concatenate([x_matrix, y_matrix], axis=2)
-        return matrix
-
 def wbc_crit(x):
     if (x > 12 or x < 4) and x != 0:
         return 1
@@ -138,10 +126,11 @@ def temp_crit(x):
     else:
         return 0
 
-
 def get_target(df, target):
+    target_df = pd.DataFrame()
+
     if target == "MI":
-        df[target] = ((df["troponin"] > 0.4) & (df["CKD"] == 0)).apply(lambda x: int(x))
+        target_df[target] = ((df["troponin"] > 0.4) & (df["CKD"] == 0)).apply(lambda x: int(x))
     elif target == "SEPSIS":
         df["hr_sepsis"] = df["heart rate"].apply(lambda x: 1 if x > 90 else 0)
         df["respiratory rate_sepsis"] = df["respiratory rate"].apply(
@@ -155,7 +144,7 @@ def get_target(df, target):
             + df["wbc_sepsis"]
             + df["temperature f_sepsis"]
         )
-        df[target] = ((df["sepsis_points"] >= 2) & (df["Infection"] == 1)).apply(
+        target_df[target] = ((df["sepsis_points"] >= 2) & (df["Infection"] == 1)).apply(
             lambda x: int(x)
         )
         del df["hr_sepsis"]
@@ -168,25 +157,64 @@ def get_target(df, target):
         df["blood_thinner"] = (
             df["heparin"] + df["enoxaparin"] + df["fondaparinux"]
         ).apply(lambda x: 1 if x >= 1 else 0)
-        df[target] = df["blood_thinner"] & df["ct_angio"]
+        target_df[target] = df["blood_thinner"] & df["ct_angio"]
         del df["blood_thinner"]
     elif target == "VANCOMYCIN":
-        df["VANCOMYCIN"] = df["vancomycin"].apply(lambda x: 1 if x > 0 else 0)
+        target_df["VANCOMYCIN"] = df["vancomycin"].apply(lambda x: 1 if x > 0 else 0)
         del df["vancomycin"]
-    elif isinstance(target, list):
+    elif isinstance(target, dict):
+        # MASK FEATURES
+        target_df = df.drop(columns = ['HADMID_DAY', "SUBJECT_ID", 'DOB', "YOB", "ADMITYEAR", 'ADMITTIME'])
+        if target['features'] != 'all':
+           target_df = target_df[target['features']]
 
-        print(df)
+        def nan_normalize(df):
+            hadm_id = df['HADM_ID']
+            df_na = df.drop(columns='HADM_ID').replace(0, np.NaN)
+            df = (df_na - df_na.mean()) / df_na.std()
+            df['HADM_ID'] = hadm_id
+            return df.replace(np.NaN, 0)
 
-        df_features_grouped = df.groupby("HADM_ID").apply(lambda x: x.iloc[:-1]).reset_index(drop=True)
-        df_labels_grouped = df.groupby("HADM_ID")[target].apply(lambda x: x.shift(-1).iloc[:-1]).reset_index(drop=True).add_suffix('_label')
-        df = pd.concat([df_features_grouped, df_labels_grouped], axis=1)
-        
-    df = df.select_dtypes(exclude=["object"])
+        def window_max_delta(group):
+            hadm_id = group['HADM_ID'].iloc[:-target['forward']]
+            group = group.drop(columns='HADM_ID')
 
-    return df
+            max = group[::-1].shift().rolling(target['forward']).max()[::-1].iloc[:-target['forward']]
+            min = group[::-1].shift().rolling(target['forward']).min()[::-1].iloc[:-target['forward']]
+            group = group.iloc[:-target['forward']]
 
-def get_columns(df, target):
-    COLUMNS = list(df.columns)
+            max_diff = max.values - group.values
+            min_diff = min.values - group.values
+            abs_diff = np.where(np.abs(max_diff) > np.abs(min_diff), max_diff, min_diff)
+            group = pd.DataFrame(abs_diff, index = group.index, columns = group.columns)
+            group['HADM_ID'] = hadm_id
+            return group
+
+        target_df = nan_normalize(target_df)
+
+        if target['forward'] > 0:
+            target_df = target_df.groupby("HADM_ID").apply(window_max_delta).reset_index(drop=True)
+            df = df.groupby("HADM_ID").apply(lambda group: group.iloc[:-target['forward']]).reset_index(drop=True)
+
+        if target['trend'] > 0:
+            hadm_id = target_df['HADM_ID'].copy()
+            values = target_df.values
+            values[values >= target['trend']] = 1
+            values[values <= -target['trend']] = 1
+            values[np.abs(values) != 1] = 0
+            target_df = pd.DataFrame(values, index = target_df.index, columns = target_df.columns)
+            target_df['HADM_ID'] = hadm_id
+
+        if target['dropout'] > 0:
+            mask = np.random.choice([True, False], size=df.shape, p=[target['dropout'], 1-target['dropout']])
+            df = df.mask(mask)
+        target_df = target_df.drop(columns = ['HADM_ID'])
+
+    feature_df = df.select_dtypes(exclude=["object"])
+    return feature_df, target_df
+
+def get_feature_columns(feature_df, target):
+    COLUMNS = list(feature_df.columns)
 
     if target == "MI":
         toss = [
@@ -225,45 +253,34 @@ def get_columns(df, target):
         toss = ["ct_angio", "Infection", "CKD"]
         COLUMNS = [i for i in COLUMNS if i not in toss]
     
-    if isinstance(target, list):
-        toss = [x + '_label' for x in target]
-        COLUMNS = [i for i in COLUMNS if i not in toss]
-    else:
-        COLUMNS.remove(target)
-
-    if "HADM_ID" in COLUMNS:
-        COLUMNS.remove("HADM_ID")
-    if "SUBJECT_ID" in COLUMNS:
-        COLUMNS.remove("SUBJECT_ID")
-    if "YOB" in COLUMNS:
-        COLUMNS.remove("YOB")
-    if "ADMITYEAR" in COLUMNS:
-        COLUMNS.remove("ADMITYEAR")
+    toss = ["HADM_ID", "SUBJECT_ID", "YOB", "ADMITYEAR"]
+    COLUMNS = [i for i in COLUMNS if i not in toss]
     return COLUMNS
 
-def to_matrix(df, target, time_steps):
-    COLUMNS = get_columns(df, target)
+def to_matrix(feature_df, target, target_df, time_steps):
+    FEATURE_COLUMNS = get_feature_columns(feature_df, target)
 
-    if isinstance(target, list):
-        target = [x + '_label' for x in target]
-        MATRIX = df[COLUMNS + target].values
-    else:
-        MATRIX = df[COLUMNS + [target]].values
+    FEATURE_MATRIX = feature_df[FEATURE_COLUMNS].values
+    FEATURE_MATRIX = FEATURE_MATRIX.reshape(int(FEATURE_MATRIX.shape[0] / time_steps), time_steps, FEATURE_MATRIX.shape[1])
 
-    MATRIX = MATRIX.reshape(
-        int(MATRIX.shape[0] / time_steps), time_steps, MATRIX.shape[1]
-    )
-    return MATRIX, COLUMNS
+    LABEL_MATRIX = target_df.values
+    LABEL_MATRIX = LABEL_MATRIX.reshape(int(LABEL_MATRIX.shape[0] / time_steps), time_steps, LABEL_MATRIX.shape[1])
+
+    return FEATURE_MATRIX, LABEL_MATRIX, FEATURE_COLUMNS
     
-def normalize_marix(MATRIX, pad_value, num_targets):
+def normalize_matrix(MATRIX, bool_matrix, pad_value):
     # Replace zero padded rows with nan to calculate distribution statistics
-    bool_matrix = ~MATRIX.any(axis=2)
     MATRIX[bool_matrix] = np.nan 
-    MATRIX = PadSequences().ZScoreNormalize(MATRIX, num_targets)
+    MATRIX = PadSequences().ZScoreNormalize(MATRIX)
     # Reset padded rows to zero
     bool_matrix = np.isnan(MATRIX)
     MATRIX[bool_matrix] = pad_value
-    return MATRIX, bool_matrix
+    return MATRIX
+
+def get_bool_matrix(MATRIX):
+    bool_matrix = MATRIX!=0
+    mask = ~(bool_matrix.any(axis=-1))
+    return mask
 
 def shuffle_matrix(MATRIX, bool_matrix):
     # Shuffle patient axis
@@ -273,37 +290,21 @@ def shuffle_matrix(MATRIX, bool_matrix):
     bool_matrix = bool_matrix[permutation]
     return MATRIX, bool_matrix
 
-def split_matrix(X_MATRIX, Y_MATRIX, x_bool_matrix, y_bool_matrix, 
+def split_matrix(X_MATRIX, Y_MATRIX, bool_matrix, 
                  tt_split, val_percentage):
     
     (X_TRAIN, Y_TRAIN), (X_VAL, Y_VAL), (X_TEST, Y_TEST) = split_data(
         X_MATRIX, Y_MATRIX, tt_split, val_percentage - tt_split
     )
 
-    x_val_boolmat = x_bool_matrix[
-        int(tt_split * x_bool_matrix.shape[0]) : int(
-            val_percentage * x_bool_matrix.shape[0]
-        )
-    ]
-    y_val_boolmat = y_bool_matrix[
-        int(tt_split * y_bool_matrix.shape[0]) : int(
-            val_percentage * y_bool_matrix.shape[0]
-        )
-    ]
-    if len(y_val_boolmat.shape) == 2:
-        y_val_boolmat = y_val_boolmat.reshape(
-            y_val_boolmat.shape[0], y_val_boolmat.shape[1], 1
-        )
+    val_idx_start = int(tt_split * bool_matrix.shape[0])
+    val_idx_end = int(val_percentage * bool_matrix.shape[0])
+    val_boolmat = bool_matrix[val_idx_start:val_idx_end]
 
-    x_test_boolmat = x_bool_matrix[int(val_percentage * x_bool_matrix.shape[0]) : :]
-    y_test_boolmat = y_bool_matrix[int(val_percentage * y_bool_matrix.shape[0]) : :]
-    
-    if len(y_test_boolmat.shape) == 2:
-        y_test_boolmat = y_test_boolmat.reshape(
-            y_test_boolmat.shape[0], y_test_boolmat.shape[1], 1
-        )
-    
-    return X_TRAIN, X_VAL, Y_TRAIN, Y_VAL, X_TEST, Y_TEST, x_test_boolmat, y_test_boolmat, x_val_boolmat, y_val_boolmat
+    test_idx_start = int(val_percentage * bool_matrix.shape[0])
+    test_boolmat = bool_matrix[test_idx_start : :]
+
+    return X_TRAIN, X_VAL, Y_TRAIN, Y_VAL, X_TEST, Y_TEST, val_boolmat, test_boolmat
     
 def return_data(
     FILE,
@@ -324,7 +325,6 @@ def return_data(
       target : desired target, supports MI, SEPSIS, VANCOMYCIN or a known lab, medication
       return_cols : return columns used for this RNN
       tt_split : fraction of dataset to use fro training, remaining is used for test
-      cross_val : parameter that returns entire matrix unsplit and unbalanced for cross val purposes
       time_steps : 14 by default, required for padding
       split : creates test train splits
       pad : by default is True, will pad to the time_step value
@@ -334,26 +334,27 @@ def return_data(
     """
 
     df = pd.read_csv(FILE)
-    df = get_target(df, target)
-    N_target = len(target) if isinstance(target, list) else 1
+
+    feature_df, target_df = get_target(df, target)
 
     if pad:
         pad_value = 0
+        N_targets = len(target_df.columns)
+        df = pd.concat([feature_df, target_df.add_suffix('_label')], axis = 1)
         df = PadSequences().pad(df, 1, time_steps, pad_value=pad_value)
-    
-    MATRIX, COLUMNS = to_matrix(df, target, time_steps)
-    MATRIX, bool_matrix = normalize_marix(MATRIX, pad_value, N_target)
-    MATRIX, bool_matrix = shuffle_matrix(MATRIX, bool_matrix)
+        feature_df, target_df = df[df.columns[:-N_targets]], df[df.columns[-N_targets:]]
 
-    X_MATRIX = MATRIX[:, :, 0:-N_target]
-    Y_MATRIX = MATRIX[:, :, -N_target:]
-    x_bool_matrix = bool_matrix[:, :, 0:-N_target]
-    y_bool_matrix = bool_matrix[:, :, -N_target:]
+    FEATURE_MATRIX, LABEL_MATRIX, FEATURE_COLUMNS = to_matrix(feature_df, target, target_df, time_steps)
+    bool_matrix = get_bool_matrix(FEATURE_MATRIX)
 
-    x = split_matrix(X_MATRIX, Y_MATRIX, x_bool_matrix, y_bool_matrix, tt_split, val_percentage)
-    X_TRAIN, X_VAL, Y_TRAIN, Y_VAL, X_TEST, Y_TEST, x_test_boolmat, y_test_boolmat, x_val_boolmat, y_val_boolmat = x
-    X_TEST[x_test_boolmat] = pad_value
-    Y_TEST[y_test_boolmat] = pad_value
+    X_MATRIX = normalize_matrix(FEATURE_MATRIX, bool_matrix, pad_value)
+    Y_MATRIX = LABEL_MATRIX
+
+    x = split_matrix(X_MATRIX, Y_MATRIX, bool_matrix, tt_split, val_percentage)
+    X_TRAIN, X_VAL, Y_TRAIN, Y_VAL, X_TEST, Y_TEST, val_boolmat, test_boolmat = x
+
+    X_TEST[test_boolmat] = pad_value
+    Y_TEST[test_boolmat] = pad_value
 
     if balancer:
         assert isinstance(target, str)
@@ -386,21 +387,18 @@ def return_data(
         no_label_cols,
         X_TEST,
         Y_TEST,
-        x_test_boolmat,
-        y_test_boolmat,
-        x_val_boolmat,
-        y_val_boolmat,
-        COLUMNS,
+        val_boolmat,
+        test_boolmat,
+        FEATURE_COLUMNS,
         target
     )
-
 
 def build_seq_dataset(ROOT, TARGET):
     warnings.filterwarnings("ignore", message="DtypeWarning")
     TIME_STEPS = 15
     SAVED_DATA_PATH = Path(f"{ROOT}/saved_data")
     SAVED_DATA_PATH.mkdir(exist_ok=True)
-    fname = SAVED_DATA_PATH / (str(TARGET) + "_" + str(TIME_STEPS) + ".pkl")
+    fname = SAVED_DATA_PATH / (str(TARGET) + ".pkl")
 
     print(f"Building sequence dataset for {TARGET}, saving to {fname}")
     fname_parsed_data = f"{ROOT}/mimic_database/mapped_elements/CHARTEVENTS_reduced_24_hour_blocks_plus_admissions_plus_patients_plus_scripts_plus_icds_plus_notes.csv"
@@ -418,10 +416,10 @@ def build_seq_dataset(ROOT, TARGET):
     print("Done saving")
 
 def load_seq_dataset(ROOT, TARGET="SEPSIS"):
-    assert TARGET in ["SEPSIS", "VANCOMYCIN", "MI"] or isinstance(TARGET, list)
+    assert TARGET in ["SEPSIS", "VANCOMYCIN", "MI"] or isinstance(TARGET, dict)
     TIME_STEPS = 15
     SAVED_DATA_PATH = Path(f"{ROOT}/saved_data")
-    fname = SAVED_DATA_PATH / (str(TARGET) + "_" + str(TIME_STEPS) + ".pkl")
+    fname = SAVED_DATA_PATH / (str(TARGET) + ".pkl")
     if not os.path.exists(fname):
         raise ValueError("File does not exist. Try running build_seq_datasets again")
     with open(fname, "rb") as f:
